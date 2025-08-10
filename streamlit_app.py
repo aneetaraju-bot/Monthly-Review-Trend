@@ -5,16 +5,20 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-st.set_page_config(page_title="Monthly Review – KPI by Vertical", layout="wide")
-st.title("📊 KPI by Vertical – Trends with Red/Base/Healthy Zones (No Normalization)")
-st.write("Upload your **pivot-style CSV** (row 0 = Verticals, row 1 = Metrics, rows 2+ = Months like Jan25).")
+st.set_page_config(page_title="Monthly Review – All Verticals (Composite + Zones)", layout="wide")
+st.title("📊 All Verticals in ONE Graph — Composite Trend with Red / Watch / Healthy Zones")
+
+st.write("""
+Upload your **pivot-style CSV** (row 0 = Verticals, row 1 = Metrics, rows 2+ = Months like Jan25).
+Map your 6 KPIs once. We’ll compute a **Composite KPI Score (0–100)** for each vertical, per month, and plot **all verticals together** with traffic-light zones.
+""")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
 # Month labels like Jan25, Feb25, etc.
 MONTH_PAT = re.compile(r'^[A-Za-z]{3}\d{2}$')
 
-# The six KPIs we’ll analyze (you map your file’s metric names to these)
+# The six KPIs we’ll use in the composite (you map your file’s metric names to these)
 TARGET_KPIS = [
     "AVERAGE of Course completion %",
     "AVERAGE of NPS",
@@ -24,23 +28,27 @@ TARGET_KPIS = [
     "AVERAGE of Avg Mentor Rating",
 ]
 
-# Thresholds for zones (raw values; adjust as needed)
-# Format: KPI -> (low_threshold, high_threshold)
-ZONE_THRESHOLDS = {
-    "AVERAGE of Course completion %": (50, 70),
+# Default raw thresholds for each KPI (editable in sidebar)
+DEFAULT_THRESHOLDS = {
+    "AVERAGE of Course completion %": (50, 70),    # low, healthy
     "AVERAGE of NPS": (30, 60),
-    "SUM of No of Placements(Monthly)": (10, 30),
+    "SUM of No of Placements(Monthly)": (10, 30),  # counts
     "AVERAGE of Reg to Placement %": (30, 60),
     "AVERAGE of Active Student %": (50, 75),
-    "AVERAGE of Avg Mentor Rating": (3.5, 4.2),
+    "AVERAGE of Avg Mentor Rating": (3.5, 4.2),    # out of 5
 }
 
-# -----------------------
-# Parsing the pivot
-# -----------------------
+# Composite zone bands (fixed): Red 0–50, Watch 50–75, Healthy 75–100
+RED_BAND = (0, 50)
+WATCH_BAND = (50, 75)
+HEALTHY_BAND = (75, 100)
+
+# -------------
+# Parse pivot
+# -------------
 def parse_pivot(file) -> pd.DataFrame:
     """
-    Parse pivot-style CSV into tidy long DF with columns:
+    Parse pivot-style CSV into tidy long DF:
       Month | Vertical | Metric | Value
     Row 0: Vertical names (sparse → forward-filled)
     Row 1: Metric names
@@ -87,14 +95,10 @@ def parse_pivot(file) -> pd.DataFrame:
     df = df[df["Metric"].notna()].copy()
     return df
 
-# -----------------------
-# KPI selection helpers
-# -----------------------
+# -------------
+# KPI helpers
+# -------------
 def kpi_guess_options(all_metrics):
-    """
-    Suggest metric selections for each KPI based on keywords.
-    You can adjust in the UI.
-    """
     key_map = {
         "AVERAGE of Course completion %": ["completion"],
         "AVERAGE of NPS": ["nps"],
@@ -109,136 +113,197 @@ def kpi_guess_options(all_metrics):
         preselect[k] = picks
     return preselect
 
-# -----------------------
-# Aggregation per KPI & vertical (NO normalization)
-# -----------------------
 def aggregate_by_vertical(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame:
     """
-    Build a DF: Month | Vertical | KPI | Value
-    - For each KPI, reduce multiple matched metric columns (if selected) within each vertical/month:
-        * Placements -> sum
-        * Others     -> mean
-    - Keep raw scales (no normalization).
+    Build DF: Month | Vertical | KPI | Value (raw scales, per vertical)
+      - Placements -> sum (within vertical/month if multiple columns selected)
+      - Others     -> mean
     """
-    out_rows = []
+    rows = []
     for kpi, metric_names in selections.items():
         if not metric_names:
             continue
         sdf = tidy[tidy["Metric"].isin(metric_names)].copy()
         if sdf.empty:
             continue
-
         if "placement" in kpi.lower():
             grouped = sdf.groupby(["Month", "Vertical"], sort=False)["Value"].sum().reset_index()
         else:
             grouped = sdf.groupby(["Month", "Vertical"], sort=False)["Value"].mean().reset_index()
-
         grouped["KPI"] = kpi
-        out_rows.append(grouped)
+        rows.append(grouped)
 
-    if not out_rows:
+    if not rows:
         return pd.DataFrame(columns=["Month", "Vertical", "KPI", "Value"])
 
-    df = pd.concat(out_rows, ignore_index=True)
-    # Preserve month order (as encountered)
-    cats = list(df["Month"].drop_duplicates())
-    df["Month"] = pd.Categorical(df["Month"], categories=cats, ordered=True)
-    df = df.sort_values(["KPI", "Vertical", "Month"])
-    return df
+    out = pd.concat(rows, ignore_index=True)
+    # Preserve month order
+    cats = list(out["Month"].drop_duplicates())
+    out["Month"] = pd.Categorical(out["Month"], categories=cats, ordered=True)
+    out = out.sort_values(["KPI", "Vertical", "Month"])
+    return out
 
-# -----------------------
-# Plot per KPI (lines = verticals) with zones
-# -----------------------
-def plot_kpi_by_vertical(df_kpi: pd.DataFrame, kpi_name: str):
+# -------------
+# Composite scoring (0–100) using thresholds
+# -------------
+def scale_with_thresholds(kpi_name: str, raw_values: pd.Series, low: float, healthy: float) -> pd.Series:
     """
-    Plot raw values for a single KPI, with one line per Vertical.
-    Adds zone shading based on ZONE_THRESHOLDS[kpi_name].
+    Map raw KPI values → 0..100 using two points:
+      <= low      → 0 .. ~ (linear up to)
+      >= healthy  → 100 (cap)
+      between     → linear interpolation
     """
-    sub = df_kpi[df_kpi["KPI"] == kpi_name].copy()
-    if sub.empty:
-        st.warning(f"No data to plot for: {kpi_name}")
+    s = raw_values.astype(float)
+    # Handle degenerate thresholds
+    if healthy is None or low is None or healthy <= low:
+        return s * 0  # fallback, yields zeros
+
+    # linear scale
+    scaled = (s - low) / (healthy - low) * 100.0
+    scaled = scaled.clip(lower=0, upper=100)
+    return scaled
+
+def compute_composite(vert_df: pd.DataFrame, thresholds: dict, weights: dict) -> pd.DataFrame:
+    """
+    Input DF: Month | Vertical | KPI | Value (raw)
+    Output DF: Month | Vertical | Composite (0..100)
+    Steps:
+      1) For each KPI, scale raw values to 0..100 with its (low, healthy) thresholds
+      2) Weighted mean across the 6 KPI scores → Composite
+    """
+    df = vert_df.copy()
+    df["Score"] = np.nan
+
+    for kpi, (lo, hi) in thresholds.items():
+        mask = df["KPI"] == kpi
+        if mask.any():
+            df.loc[mask, "Score"] = scale_with_thresholds(kpi, df.loc[mask, "Value"], lo, hi)
+
+    # If some KPIs missing for a vertical/month, average the available ones (weighting only what exists)
+    # Pivot to sum weights per row
+    df["Weight"] = df["KPI"].map(weights).fillna(0.0)
+    # Keep only rows that got a score
+    df_scored = df.dropna(subset=["Score"]).copy()
+
+    # Normalize weights within each Month/Vertical (only across present KPIs)
+    def _weighted_mean(g):
+        w = g["Weight"].values
+        x = g["Score"].values
+        if w.sum() == 0:
+            return np.nanmean(x) if len(x) else np.nan
+        return np.average(x, weights=w)
+
+    comp = (
+        df_scored.groupby(["Month", "Vertical"], sort=False)
+        .apply(_weighted_mean)
+        .reset_index(name="Composite")
+    )
+
+    # Keep order of months
+    cats = list(vert_df["Month"].drop_duplicates())
+    comp["Month"] = pd.Categorical(comp["Month"], categories=cats, ordered=True)
+    comp = comp.sort_values(["Vertical", "Month"])
+    return comp
+
+# -------------
+# Plot: all verticals on one chart with zones
+# -------------
+def plot_all_verticals_one_chart(comp_df: pd.DataFrame):
+    """
+    Single chart: X = Month, Y = Composite (0..100), line per Vertical.
+    Background zones: Red (0-50), Watch (50-75), Healthy (75-100).
+    """
+    if comp_df.empty:
+        st.error("Composite table is empty. Check KPI mapping and thresholds.")
         return
-
-    piv = sub.pivot(index="Month", columns="Vertical", values="Value")
-    piv = piv.sort_index()
 
     fig, ax = plt.subplots(figsize=(14, 8))
 
-    # Zone shading (raw thresholds)
-    low, high = ZONE_THRESHOLDS.get(kpi_name, (None, None))
-    if low is not None and high is not None:
-        ymax = np.nanmax(piv.values) if np.isfinite(np.nanmax(piv.values)) else high
-        # Safeguard if ymax < high
-        ymax = max(ymax, high)
-        ax.axhspan(0, low, color="red", alpha=0.10, label="_redzone_")
-        ax.axhspan(low, high, color="yellow", alpha=0.10, label="_basezone_")
-        ax.axhspan(high, ymax, color="green", alpha=0.10, label="_healthzone_")
+    # Zone bands
+    ax.axhspan(RED_BAND[0], RED_BAND[1], color="red", alpha=0.10, label="_redzone_")
+    ax.axhspan(WATCH_BAND[0], WATCH_BAND[1], color="yellow", alpha=0.10, label="_watchzone_")
+    ax.axhspan(HEALTHY_BAND[0], HEALTHY_BAND[1], color="green", alpha=0.10, label="_healthzone_")
 
-    # Plot a line for each Vertical
-    for vertical in piv.columns:
-        ax.plot(piv.index.tolist(), piv[vertical], marker='o', label=vertical)
+    # Plot each vertical
+    months = comp_df["Month"].cat.categories.tolist() if hasattr(comp_df["Month"], "categories") else comp_df["Month"].unique().tolist()
+    for vertical in comp_df["Vertical"].unique():
+        s = comp_df[comp_df["Vertical"] == vertical].set_index("Month")["Composite"]
+        ax.plot(months, s.reindex(months), marker='o', label=vertical)
 
-    ax.set_title(f"{kpi_name} — Vertical Comparison (Raw Values)")
+    ax.set_title("All Verticals — Composite KPI Trend (0–100)")
     ax.set_xlabel("Month")
-    ax.set_ylabel("Value")
-    ax.set_xticks(range(len(piv.index)))
-    ax.set_xticklabels([str(m) for m in piv.index], rotation=45, ha='right')
-    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')  # legend outside
+    ax.set_ylabel("Composite Score (0–100)")
+    ax.set_xticks(range(len(months)))
+    ax.set_xticklabels([str(m) for m in months], rotation=45, ha='right')
+    ax.set_ylim(0, 100)
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
     ax.grid(True)
     st.pyplot(fig, clear_figure=True)
 
-# -----------------------
-# Report (per KPI & vertical)
-# -----------------------
-def classify_zone(kpi_name: str, value: float) -> str:
-    low, high = ZONE_THRESHOLDS.get(kpi_name, (None, None))
-    if low is None or high is None or pd.isna(value):
+# -------------
+# Report
+# -------------
+def classify_band(score: float) -> str:
+    if pd.isna(score):
         return "–"
-    if value < low:
+    if score < RED_BAND[1]:
         return "🟥 Red Zone"
-    elif value < high:
-        return "🟨 Base Zone"
-    else:
-        return "🟩 Healthy Zone"
+    if score < WATCH_BAND[1]:
+        return "🟨 Watch Zone"
+    return "🟩 Healthy Zone"
 
-def build_vertical_report(df: pd.DataFrame) -> str:
+def build_vertical_composite_report(comp_df: pd.DataFrame) -> str:
     """
-    Text report per KPI & Vertical:
-      - start, end, change
-      - average, high/low month
-      - zone for latest value
+    Per vertical:
+      - Start, End, Change
+      - Average composite
+      - Highest/Lowest month
+      - Current Zone
+      - Trend direction
     """
-    lines = ["TREND REPORT BY VERTICAL", "="*60, ""]
-    for kpi in df["KPI"].unique():
-        lines.append(f"## {kpi}")
-        kdf = df[df["KPI"] == kpi].copy()
-        for vertical in kdf["Vertical"].unique():
-            vdf = kdf[kdf["Vertical"] == vertical].sort_values("Month")
-            s = vdf["Value"].astype(float)
-            if s.empty:
-                continue
-            start_val, end_val = s.iloc[0], s.iloc[-1]
-            change = end_val - start_val
-            trend = "↑ Increasing" if change > 0 else "↓ Decreasing" if change < 0 else "→ Stable"
-            avg_val = s.mean()
-            high_idx = s.idxmax()
-            low_idx  = s.idxmin()
-            high_month = vdf.loc[high_idx, "Month"]
-            low_month  = vdf.loc[low_idx,  "Month"]
-            zone = classify_zone(kpi, end_val)
+    lines = ["ALL VERTICALS — COMPOSITE REPORT", "="*60, ""]
+    for vertical in comp_df["Vertical"].unique():
+        v = comp_df[comp_df["Vertical"] == vertical].sort_values("Month")
+        s = v["Composite"].astype(float)
+        if s.empty:
+            continue
+        start_val, end_val = s.iloc[0], s.iloc[-1]
+        change = end_val - start_val
+        trend = "↑ Improving" if change > 0 else "↓ Declining" if change < 0 else "→ Stable"
+        avg_val = s.mean()
+        hi_idx = s.idxmax(); lo_idx = s.idxmin()
+        hi_month = v.loc[hi_idx, "Month"]; lo_month = v.loc[lo_idx, "Month"]
+        zone = classify_band(end_val)
 
-            lines.append(f"- **{vertical}**: {trend}")
-            lines.append(f"  Start {start_val:.2f} → End {end_val:.2f} (Δ {change:+.2f}) | Avg {avg_val:.2f}")
-            lines.append(f"  High {s.max():.2f} in {high_month} | Low {s.min():.2f} in {low_month} | {zone}")
-        lines.append("")  # blank after each KPI block
+        lines.append(f"**{vertical}** — {trend} | Current: {end_val:.1f} ({zone})")
+        lines.append(f"  Start {start_val:.1f} → End {end_val:.1f} (Δ {change:+.1f}) | Avg {avg_val:.1f}")
+        lines.append(f"  High {s.max():.1f} in {hi_month} | Low {s.min():.1f} in {lo_month}")
     return "\n".join(lines)
 
-# -----------------------
+# -------------
+# Sidebar controls (thresholds + weights)
+# -------------
+st.sidebar.header("Composite Settings")
+
+thresholds = {}
+weights = {}
+for kpi in TARGET_KPIS:
+    st.sidebar.subheader(kpi)
+    default_lo, default_hi = DEFAULT_THRESHOLDS[kpi]
+    lo = st.sidebar.number_input(f"{kpi} — Red↔Watch threshold (Low)", value=float(default_lo))
+    hi = st.sidebar.number_input(f"{kpi} — Watch↔Healthy threshold (High)", value=float(default_hi))
+    if hi <= lo:
+        st.sidebar.warning("High must be greater than Low")
+    thresholds[kpi] = (lo, hi)
+
+    w = st.sidebar.slider(f"Weight for {kpi}", min_value=0.0, max_value=5.0, value=1.0, step=0.1)
+    weights[kpi] = w
+
+# -------------
 # App flow
-# -----------------------
+# -------------
 if uploaded:
     tidy = parse_pivot(uploaded)
-
     if tidy.empty:
         st.error("Parsed 0 rows. Check export: row0=verticals, row1=metrics, rows 2+=months (e.g., Jan25).")
         st.stop()
@@ -247,42 +312,33 @@ if uploaded:
     all_metrics = sorted(tidy["Metric"].dropna().unique().tolist())
     st.write(all_metrics)
 
-    st.markdown("### Map each KPI to the metric names from your file")
+    st.markdown("### Map your KPIs to the metric names in the file")
     guesses = kpi_guess_options(all_metrics)
     selections = {}
     for k in TARGET_KPIS:
-        selections[k] = st.multiselect(
-            f"Select columns for **{k}**",
-            options=all_metrics,
-            default=guesses.get(k, [])
-        )
+        selections[k] = st.multiselect(f"Select columns for **{k}**", options=all_metrics, default=guesses.get(k, []))
 
-    if st.button("Generate Vertical Comparisons", type="primary"):
-        agg_vert = aggregate_by_vertical(tidy, selections)
+    if st.button("Generate SINGLE GRAPH (All Verticals) + Report", type="primary"):
+        # 1) Raw per-vertical KPI values
+        vert_raw = aggregate_by_vertical(tidy, selections)
+        st.caption(f"Tidy rows: {len(tidy):,} | Per-vertical KPI rows: {len(vert_raw):,}")
 
-        # Diagnostics
-        st.caption(f"Tidy rows: {len(tidy):,} | After vertical aggregation: {len(agg_vert):,}")
-        missing = [k for k in TARGET_KPIS if k not in agg_vert["KPI"].unique()]
-        if missing:
-            st.warning("No aggregated data for: " + ", ".join(missing))
-
-        if agg_vert.empty:
-            st.error("Nothing to plot. Adjust KPI selections or check your CSV.")
+        if vert_raw.empty:
+            st.error("Nothing aggregated. Adjust KPI selections or check your CSV.")
         else:
-            # One chart per KPI (lines = verticals), with zone shading
-            for kpi in TARGET_KPIS:
-                if kpi in agg_vert["KPI"].unique():
-                    st.subheader(f"📈 {kpi}")
-                    plot_kpi_by_vertical(agg_vert, kpi)
+            # 2) Composite 0..100 per vertical/month
+            comp_df = compute_composite(vert_raw, thresholds, weights)
 
-            # Report
-            st.subheader("📝 Trend Report (by Vertical)")
-            report_txt = build_vertical_report(agg_vert)
+            st.subheader("📈 All Verticals — ONE Chart (Composite 0–100)")
+            plot_all_verticals_one_chart(comp_df)
+
+            st.subheader("📝 Report (All Verticals — Composite)")
+            report_txt = build_vertical_composite_report(comp_df)
             st.code(report_txt)
             st.download_button(
-                "⬇️ Download trend_report_by_vertical.txt",
+                "⬇️ Download composite_report.txt",
                 report_txt.encode("utf-8"),
-                file_name="trend_report_by_vertical.txt",
+                file_name="composite_report.txt",
                 mime="text/plain"
             )
 else:
