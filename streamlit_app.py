@@ -1,165 +1,108 @@
-# streamlit_app.py
-import io, re, traceback
+import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import streamlit as st
 
-st.set_page_config(page_title="Combined KPI Trends", layout="wide")
-st.title("Combined KPI Trends — One Visual + Full Report")
+st.set_page_config(page_title="Monthly Business Review", layout="wide")
 
-st.markdown("""
-Upload **one CSV** and select the Month column and **your KPI columns**.
-Works with any header names (e.g., *AVERAGE of Course completion %*, *AVERAGE of NPS*, etc.).
-""")
+st.title("📊 Monthly Business Review - Combined KPI Trends")
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
+uploaded_file = st.file_uploader("Upload pivot-style CSV", type=["csv"])
 
-def clean_headers(cols):
-    # keep original text but trim surrounding spaces for matching
-    return [c.strip() for c in cols]
+def parse_pivot_csv(file):
+    raw = pd.read_csv(file, header=None)
+    vertical_row = raw.iloc[0]
+    metric_row = raw.iloc[1]
 
-def coerce_numeric(series: pd.Series) -> pd.Series:
-    # remove %, commas, and spaces; convert to number
-    s = (series.astype(str)
-               .str.replace('%', '', regex=False)
-               .str.replace(',', '', regex=False)
-               .str.strip())
-    return pd.to_numeric(s, errors='coerce')
+    # Forward-fill verticals
+    verticals = []
+    current_vertical = None
+    for v in vertical_row:
+        if pd.notna(v):
+            current_vertical = v
+        verticals.append(current_vertical)
 
-def guess_month_columns(df: pd.DataFrame):
-    # try header-name guess
-    name_hits = [c for c in df.columns if any(k in c.lower() for k in ["month", "date", "helper"])]
-    # try value-pattern guess (Jan25, Feb25, etc.)
-    pat = re.compile(r'^[A-Za-z]{3}\d{2}$')
-    value_hits = []
-    for c in df.columns:
-        try:
-            vals = df[c].astype(str).dropna().head(10)
-            if (vals.str.match(pat)).mean() > 0.5:
-                value_hits.append(c)
-        except Exception:
-            pass
-    # de‑duplicate, preserve order (name hits first)
-    seen, out = set(), []
-    for c in name_hits + value_hits + list(df.columns):
-        if c not in seen:
-            out.append(c); seen.add(c)
-    return out
+    records = []
+    for col_idx in range(1, raw.shape[1]):
+        vertical = verticals[col_idx]
+        metric = metric_row[col_idx]
+        for row_idx in range(2, raw.shape[0]):
+            month = str(raw.iloc[row_idx, 0])
+            value = raw.iloc[row_idx, col_idx]
+            if isinstance(value, str):
+                value = value.replace('%', '').replace(',', '').strip()
+            try:
+                value = float(value)
+            except:
+                value = np.nan
+            records.append([month, vertical, metric, value])
 
-def generate_report(df: pd.DataFrame, month_col: str, metric_cols):
-    lines = ["TREND REPORT", "="*50, ""]
-    for metric in metric_cols:
-        s = pd.to_numeric(df[metric], errors='coerce').dropna()
-        if s.empty:
-            continue
-        start_val, end_val = s.iloc[0], s.iloc[-1]
-        change = end_val - start_val
-        trend = "↑ Increasing" if change > 0 else "↓ Decreasing" if change < 0 else "→ Stable"
-        avg_val = s.mean()
-        high_idx = s.idxmax()
-        low_idx = s.idxmin()
-        high_month = df.loc[high_idx, month_col]
-        low_month = df.loc[low_idx, month_col]
+    df = pd.DataFrame(records, columns=["Month", "Vertical", "Metric", "Value"])
+    return df
 
-        lines.append(f"{metric}: {trend}")
-        lines.append(f"  Start: {start_val:.2f}, End: {end_val:.2f} (Change: {change:+.2f})")
-        lines.append(f"  Average: {avg_val:.2f}")
-        lines.append(f"  Highest: {s.max():.2f} in {high_month}")
-        lines.append(f"  Lowest: {s.min():.2f} in {low_month}")
-        lines.append("  ✅ Ending above average – good momentum" if end_val > avg_val
-                     else "  ⚠ Ending below average – needs attention")
-        lines.append("")
-    return "\n".join(lines)
+def aggregate_kpis(df):
+    keep_metrics = [
+        "AVERAGE of Course completion %",
+        "AVERAGE of NPS",
+        "SUM of No of Placements(Monthly)",
+        "AVERAGE of Reg to Placement %",
+        "AVERAGE of Active Student %",
+        "AVERAGE of Avg Mentor Rating"
+    ]
+    df = df[df["Metric"].isin(keep_metrics)]
 
-def plot_combined(df: pd.DataFrame, month_col: str, metric_cols, normalize=False, rating_max=5.0):
-    plot_df = df.copy()
-    if normalize:
-        for col in metric_cols:
-            name = col.lower()
-            s = plot_df[col].astype(float)
-            if "rating" in name:
-                plot_df[col] = (s / rating_max) * 100.0
-            elif "placement" in name and "%" not in name:
-                # counts → scale to 0–100 by max for readability
-                m = np.nanmax(s.values)
-                plot_df[col] = (s / m) * 100.0 if m and m > 0 else s
-            # percentages are already numeric percentages after cleaning
+    # Decide aggregation
+    agg_rules = {
+        "SUM of No of Placements(Monthly)": "sum"
+    }
+    for m in keep_metrics:
+        if m not in agg_rules:
+            agg_rules[m] = "mean"
 
-    months = plot_df[month_col].astype(str).tolist()
+    agg_df = df.groupby(["Month", "Metric"]).agg({"Value": agg_rules.get}).reset_index()
+
+    # Sort months if needed
+    agg_df["Month"] = pd.Categorical(agg_df["Month"], categories=agg_df["Month"].unique(), ordered=True)
+    return agg_df
+
+def plot_combined_chart(agg_df):
     fig, ax = plt.subplots(figsize=(14, 8))
-    for metric in metric_cols:
-        ax.plot(months, plot_df[metric], marker='o', label=metric)
+    for metric in agg_df["Metric"].unique():
+        subset = agg_df[agg_df["Metric"] == metric]
+        ax.plot(subset["Month"], subset["Value"], marker='o', label=metric)
 
-    ax.set_title("Combined KPI Trends")
     ax.set_xlabel("Month")
-    ax.set_ylabel("Value" + (" (normalized to %)" if normalize else ""))
-    ax.set_xticks(range(len(months)))
-    ax.set_xticklabels(months, rotation=45, ha='right')
-    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.set_ylabel("Value")
+    ax.set_title("Combined KPI Trends")
     ax.grid(True)
-    st.pyplot(fig, clear_figure=True)
+    ax.legend(loc='center left', bbox_to_anchor=(1, 0.5))
+    plt.xticks(rotation=45)
+    st.pyplot(fig)
 
-if uploaded:
-    try:
-        df_raw = pd.read_csv(uploaded)
-        df_raw.columns = clean_headers(df_raw.columns)
+def generate_trend_report(agg_df):
+    report_lines = []
+    for metric in agg_df["Metric"].unique():
+        subset = agg_df[agg_df["Metric"] == metric]
+        start = subset["Value"].iloc[0]
+        end = subset["Value"].iloc[-1]
+        change = end - start
+        avg_val = subset["Value"].mean()
+        high_val = subset["Value"].max()
+        low_val = subset["Value"].min()
+        status = "✅ Above Avg" if end >= avg_val else "⚠ Below Avg"
+        report_lines.append(f"{metric}: Start={start:.2f}, End={end:.2f}, Change={change:.2f}, "
+                            f"Avg={avg_val:.2f}, High={high_val:.2f}, Low={low_val:.2f} → {status}")
+    return "\n".join(report_lines)
 
-        st.subheader("Preview")
-        st.dataframe(df_raw.head(20), use_container_width=True, hide_index=True)
+if uploaded_file:
+    df = parse_pivot_csv(uploaded_file)
+    agg_df = aggregate_kpis(df)
 
-        st.markdown("### Select columns")
-        # Month select (smart defaults)
-        month_options = guess_month_columns(df_raw)
-        month_col = st.selectbox("Month column", options=list(df_raw.columns),
-                                 index=list(df_raw.columns).index(month_options[0]) if month_options else 0)
+    st.subheader("📈 Combined KPI Chart")
+    plot_combined_chart(agg_df)
 
-        # Suggest metric columns by keyword
-        suggested = [n for n in df_raw.columns if any(k in n.lower() for k in [
-            "completion", "nps", "placement", "reg to placement", "active", "mentor", "rating"
-        ])]
-        metric_cols = st.multiselect(
-            "KPI columns (pick your six)",
-            options=list(df_raw.columns),
-            default=suggested[:6] if suggested else []
-        )
+    st.subheader("📝 Trend Report")
+    report_text = generate_trend_report(agg_df)
+    st.text(report_text)
 
-        st.caption("Tip: Your six KPIs are usually named like: "
-                   "‘AVERAGE of Course completion %’, ‘AVERAGE of NPS’, "
-                   "‘SUM of No of Placements(Monthly)’, ‘AVERAGE of Reg to Placement %’, "
-                   "‘AVERAGE of Active Student %’, ‘AVERAGE of Avg Mentor Rating’.")
-
-        normalize = st.checkbox("Normalize dissimilar scales to % (ratings & counts → % for a single scale)", value=False)
-        rating_max = st.number_input("If normalizing, Mentor Rating max is", min_value=1.0, max_value=10.0, value=5.0, step=0.5)
-
-        if st.button("Generate Visual + Report", type="primary"):
-            if not month_col or not metric_cols:
-                st.error("Select the Month column and at least one KPI column.")
-                st.stop()
-
-            df = df_raw.copy()
-            # Clean KPI columns to numeric
-            for col in metric_cols:
-                df[col] = coerce_numeric(df[col])
-
-            # Drop rows missing month or all metrics
-            df = df[df[month_col].notna()].reset_index(drop=True)
-            if df.empty:
-                st.error("No valid data rows after cleaning — check your file contents.")
-                st.stop()
-
-            # Render chart
-            plot_combined(df, month_col, metric_cols, normalize=normalize, rating_max=rating_max)
-
-            # Build & download report (always uses raw values, not normalized)
-            report = generate_report(df, month_col, metric_cols)
-            st.subheader("Trend Report")
-            st.code(report)
-            st.download_button("⬇️ Download trend_report.txt", report.encode("utf-8"),
-                               file_name="trend_report.txt", mime="text/plain")
-
-    except Exception as e:
-        st.error("Something went wrong while processing your file.")
-        st.exception(e)  # show full stacktrace inside the app
-else:
-    st.info("Upload a CSV to continue.")
+    st.download_button("Download Trend Report", report_text, file_name="trend_report.txt")
