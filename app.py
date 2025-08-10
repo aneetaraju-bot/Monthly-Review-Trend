@@ -1,52 +1,64 @@
-# app.py (diagnostic-safe vertical comparison)
+# app.py
 import re
 import io
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
-import traceback
 
-st.set_page_config(page_title="Monthly Review — Vertical Comparison (Safe)", layout="wide")
+st.set_page_config(page_title="Monthly Review — Vertical Comparison", layout="wide")
 st.title("📊 Monthly Review — Vertical Comparison (All Verticals per KPI)")
-st.write("Upload your **pivot-style CSV**: row 0 = Verticals, row 1 = KPIs, rows 2+ = Months like Jan25.")
+st.write("Upload your **pivot-style CSV**: row 0 = Verticals, row 1 = KPIs, rows 2+ = Months like Jan25 or Jan 25.")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
-MONTH_PAT = re.compile(r'^[A-Za-z]{3}\d{2}$')
+# Month labels like Jan25 or Jan 25 (optional space)
+MONTH_PAT = re.compile(r'^[A-Za-z]{3}\s?\d{2}$')
 
+# ----- Zone thresholds (edit to your targets) -----
 THRESHOLDS = {
-    "AVERAGE of Course completion %": (50, 70),
+    "AVERAGE of Course completion %": (50, 70),          # (<50 Red, 50–70 Watch, >70 Healthy)
     "AVERAGE of NPS": (30, 60),
-    "SUM of No of Placements(Monthly)": (10, 30),
+    "SUM of No of Placements(Monthly)": (10, 30),        # counts
     "AVERAGE of Reg to Placement %": (30, 60),
     "AVERAGE of Active Student %": (50, 75),
-    "AVERAGE of Avg Mentor Rating": (3.5, 4.2),
+    "AVERAGE of Avg Mentor Rating": (3.5, 4.2),          # out of 5
 }
 TARGET_KPIS = list(THRESHOLDS.keys())
 
+# -----------------------
+# Read CSV (robustly)
+# -----------------------
 def safe_read_csv(file):
-    """Try multiple encodings and separators; show a preview."""
+    """Try multiple encodings and separators; return a raw DataFrame."""
     tried = []
     for enc in ["utf-8-sig", "utf-8", "latin1"]:
         for sep in [",", ";", "\t"]:
             try:
                 df = pd.read_csv(file, header=None, encoding=enc, sep=sep, engine="python")
-                return df, enc, sep
+                return df
             except Exception as e:
                 tried.append(f"{enc}/{repr(sep)} -> {e.__class__.__name__}")
                 file.seek(0)  # reset buffer
-    raise RuntimeError("Could not read CSV with tried variants:\n" + "\n".join(tried))
+    raise RuntimeError("Could not read CSV. Tried:\n" + "\n".join(tried))
 
+# -----------------------
+# Parse pivot → tidy long
+# -----------------------
 def parse_pivot(raw: pd.DataFrame) -> pd.DataFrame:
-    """Return tidy DF: Month | Vertical | KPI | Value. Robust to blanks & text."""
+    """
+    Return tidy DF: Month | Vertical | KPI | Value
+    Row 0: Vertical names (sparse → forward-filled)
+    Row 1: KPI names
+    Row 2+: Month + values
+    """
     if raw.shape[0] < 3 or raw.shape[1] < 2:
         return pd.DataFrame(columns=["Month","Vertical","KPI","Value"])
 
     vertical_row = raw.iloc[0].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan})
     metric_row   = raw.iloc[1].astype(str).str.strip().replace({'nan': np.nan, 'None': np.nan})
 
-    # Forward-fill vertical names across columns
+    # forward-fill verticals across columns
     verticals, last_v = [], None
     for v in vertical_row:
         if pd.notna(v) and v != "":
@@ -61,25 +73,32 @@ def parse_pivot(raw: pd.DataFrame) -> pd.DataFrame:
         if (pd.isna(kpi) or str(kpi).strip()=="") and (pd.isna(vertical) or str(vertical).strip()==""):
             continue
         for i in range(2, raw.shape[0]):
-            month = str(raw.iloc[i, 0]).strip()
-            if not month or month.lower() in ("nan","none"):
+            month = str(raw.iloc[i, 0]).strip().replace("  ", " ")
+            if not month or month.lower() in ("nan", "none"):
                 continue
             if not MONTH_PAT.match(month):
                 # keep only month-like rows to avoid totals/notes
                 continue
             val = raw.iloc[i, j]
             if isinstance(val, str):
-                val = val.replace('%','').replace(',','').strip()
+                val = (val.replace('%','')
+                           .replace(',','')
+                           .replace('#DIV/0!','')
+                           .strip())
             try:
                 val = float(val)
             except Exception:
                 val = np.nan
-            records.append([month, vertical, kpi, val])
+            records.append([month.replace(" ", ""), vertical, kpi, val])  # normalize month e.g., "Jan 25"->"Jan25"
 
     df = pd.DataFrame(records, columns=["Month","Vertical","KPI","Value"])
     return df.dropna(subset=["KPI"]).reset_index(drop=True)
 
+# -----------------------
+# KPI selection helpers
+# -----------------------
 def kpi_guess_options(all_metrics):
+    # Suggest likely matches; user can adjust in UI
     key_map = {
         "AVERAGE of Course completion %": ["completion"],
         "AVERAGE of NPS": ["nps"],
@@ -94,7 +113,15 @@ def kpi_guess_options(all_metrics):
         pre[k] = picks
     return pre
 
+# -----------------------
+# Aggregate per KPI & vertical (NO normalization)
+# -----------------------
 def aggregate_vertical_kpi(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame:
+    """
+    Return Month | Vertical | KPI | Value (raw)
+      - Placements → sum if multiple cols selected
+      - Others     → mean
+    """
     out = []
     for kpi, cols in selections.items():
         if not cols:
@@ -115,6 +142,9 @@ def aggregate_vertical_kpi(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame
     df["Month"] = pd.Categorical(df["Month"], categories=cats, ordered=True)
     return df.sort_values(["KPI","Vertical","Month"])
 
+# -----------------------
+# Vertical comparison charts for ALL KPIs
+# -----------------------
 def show_all_vertical_comparisons(agg: pd.DataFrame, thresholds: dict):
     kpis = [k for k in thresholds.keys() if k in agg["KPI"].unique()]
     for kpi in kpis:
@@ -123,14 +153,13 @@ def show_all_vertical_comparisons(agg: pd.DataFrame, thresholds: dict):
             st.warning(f"No rows for {kpi}")
             continue
         piv = sub.pivot(index="Month", columns="Vertical", values="Value").sort_index()
-        # Guard: if pivot is entirely NaN or has no columns
         if piv.empty or np.all(np.isnan(piv.values)):
             st.warning(f"{kpi}: no numeric values to plot.")
             continue
 
         fig, ax = plt.subplots(figsize=(12, 6))
         low, high = thresholds[kpi]
-        # Determine ymax safely
+
         finite_vals = piv.values[np.isfinite(piv.values)]
         ymax = float(np.nanmax(finite_vals)) if finite_vals.size else high
         ymax = max(ymax, high)
@@ -151,9 +180,13 @@ def show_all_vertical_comparisons(agg: pd.DataFrame, thresholds: dict):
         ax.grid(True)
         st.pyplot(fig, clear_figure=True)
 
+# -----------------------
+# Simple summary (latest month per vertical & KPI)
+# -----------------------
 def quick_zone_summary(agg: pd.DataFrame, thresholds: dict) -> str:
     if agg.empty:
         return "No data after aggregation."
+
     def last_row(g): return g.sort_values("Month").iloc[-1]
     latest = agg.groupby(["KPI","Vertical"], group_keys=False).apply(last_row)
 
@@ -179,23 +212,25 @@ def quick_zone_summary(agg: pd.DataFrame, thresholds: dict) -> str:
         lines.append("")
     return "\n".join(lines)
 
+# -----------------------
+# App flow
+# -----------------------
 if uploaded:
     try:
-        raw, used_enc, used_sep = safe_read_csv(uploaded)
-        st.caption(f"CSV read with encoding **{used_enc}** and separator **{repr(used_sep)}**")
+        raw = safe_read_csv(uploaded)
         st.subheader("Raw preview (first 8 rows)")
         st.dataframe(raw.head(8), use_container_width=True)
 
         tidy = parse_pivot(raw)
         if tidy.empty:
-            st.error("Parsed 0 rows. Check CSV layout: row0=verticals, row1=KPIs, and first column has months like Jan25.")
+            st.error("Parsed 0 rows. Check CSV: row0=verticals, row1=KPIs, first column has months like Jan25/Jan 25.")
             st.stop()
 
-        st.subheader("Detected KPIs")
+        st.subheader("Detected KPIs in your file")
         all_metrics = sorted(tidy["KPI"].dropna().unique().tolist())
         st.write(all_metrics)
 
-        st.markdown("### Map each target KPI to names from your file")
+        st.markdown("### Map each target KPI to the KPI names in your file")
         guesses = {
             "AVERAGE of Course completion %": [m for m in all_metrics if "completion" in m.lower()],
             "AVERAGE of NPS": [m for m in all_metrics if "nps" in m.lower()],
@@ -211,18 +246,18 @@ if uploaded:
         if st.button("Generate Vertical Comparisons + Summary", type="primary"):
             agg = aggregate_vertical_kpi(tidy, selections)
             st.caption(f"Tidy rows: {len(tidy):,} | Aggregated rows: {len(agg):,}")
+
             if agg.empty:
                 st.error("Nothing aggregated. Adjust KPI selections or check your CSV.")
             else:
                 show_all_vertical_comparisons(agg, THRESHOLDS)
+
                 st.subheader("📝 Quick Zone Summary (Latest Month)")
                 report_text = quick_zone_summary(agg, THRESHOLDS)
                 st.code(report_text)
                 st.download_button("⬇️ Download summary.txt", report_text.encode("utf-8"),
                                    file_name="summary.txt", mime="text/plain")
-
     except Exception as e:
-        st.error("Processing error — see details below:")
-        st.exception(e)  # full traceback in the UI
+        st.error("Processing error — see details in the console/logs and confirm CSV format.")
 else:
     st.info("Upload the pivot CSV to continue.")
