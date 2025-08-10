@@ -1,50 +1,84 @@
 import io
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 import streamlit as st
-from trend_logic import load_and_clean, package_downloads
 
-st.set_page_config(page_title="MBR Trend Charts & Report", layout="wide")
-st.title("Monthly Business Review – Trend Charts & Downloadable Report")
+st.set_page_config(page_title="Combined KPI Trends", layout="wide")
+st.title("Combined KPI Trends – Single Visual + Full Report")
 
-st.write("Upload the **combined CSV** with all verticals (same format you shared).")
+st.markdown("""
+Upload a **single CSV** with these columns (exact names recommended):  
+**Month, Course Completion %, NPS %, No of Placements, Reg to Placement %, Active Student %, Avg Mentor Rating**
+""")
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
+uploaded = st.file_uploader("Upload combined KPI CSV", type=["csv"])
 
-# Optional: show a sample note for expected format
-with st.expander("Expected CSV format (pivot export)"):
-    st.markdown("""
-    - First row after the first column contains vertical names.
-    - First column has `Helper Date`, `Vertical`, then month labels like `Jan25`, `Feb25`, ...
-    - Each cell is a percentage like `33.50%`.
-    """)
+def make_chart_and_report(df: pd.DataFrame):
+    # Ensure Month is str and keep metric columns in order
+    df['Month'] = df['Month'].astype(str)
+    metrics = [c for c in df.columns if c != 'Month']
 
-if uploaded:
-    raw = pd.read_csv(uploaded, header=0)
-    df = load_and_clean(raw)
+    # --- Chart: combined line chart (clean & readable) ---
+    fig, ax = plt.subplots(figsize=(14, 8))
+    for metric in metrics:
+        ax.plot(df['Month'], df[metric], marker='o', label=metric)
 
-    st.subheader("Cleaned Data Preview")
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    ax.set_title("Combined KPI Trends")
+    ax.set_xlabel("Month")
+    ax.set_ylabel("Value")
+    ax.set_xticks(range(len(df['Month'])))
+    ax.set_xticklabels(df['Month'], rotation=45, ha='right')
+    ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+    ax.grid(True)
+    st.pyplot(fig, clear_figure=True)
 
-    # Generate all charts + report and prepare downloads
-    zip_bytes, files = package_downloads(df)
+    # --- Report ---
+    lines = ["TREND REPORT", "="*50, ""]
+    for metric in metrics:
+        s = pd.to_numeric(df[metric], errors='coerce').dropna()
+        if s.empty:
+            continue
+        start_val, end_val = s.iloc[0], s.iloc[-1]
+        change = end_val - start_val
+        trend = "↑ Increasing" if change > 0 else "↓ Decreasing" if change < 0 else "→ Stable"
+        avg_val = s.mean()
+        high_idx = s.idxmax()
+        low_idx = s.idxmin()
+        high_month = df.loc[high_idx, 'Month']
+        low_month = df.loc[low_idx, 'Month']
 
-    st.subheader("Downloads")
+        lines.append(f"{metric}: {trend}")
+        lines.append(f"  Start: {start_val:.2f}, End: {end_val:.2f} (Change: {change:+.2f})")
+        lines.append(f"  Average: {avg_val:.2f}")
+        lines.append(f"  Highest: {s.max():.2f} in {high_month}")
+        lines.append(f"  Lowest: {s.min():.2f} in {low_month}")
+        lines.append("  ✅ Ending above average – good momentum" if end_val > avg_val
+                     else "  ⚠ Ending below average – needs attention")
+        lines.append("")
+
+    report_text = "\n".join(lines)
+    st.subheader("Trend Report")
+    st.code(report_text)
+
+    # Download button
     st.download_button(
-        label="⬇️ Download ALL (ZIP: charts + report)",
-        data=zip_bytes,
-        file_name="mbr_trends_bundle.zip",
-        mime="application/zip"
+        label="⬇️ Download trend_report.txt",
+        data=report_text.encode("utf-8"),
+        file_name="trend_report.txt",
+        mime="text/plain"
     )
 
-    # Individual downloads + inline preview
-    st.write("Or download individually:")
-    for name, buf in files.items():
-        if name.endswith(".png"):
-            st.image(buf, caption=name)
-        st.download_button(
-            label=f"Download {name}",
-            data=buf.getvalue(),
-            file_name=name
-        )
+if uploaded:
+    df = pd.read_csv(uploaded)
+    # light cleanup if CSV includes % signs for percentage columns
+    for col in df.columns:
+        if col != "Month":
+            df[col] = (df[col].astype(str).str.replace('%','', regex=False)
+                                   .str.replace(',','', regex=False))
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+    st.subheader("Preview")
+    st.dataframe(df, use_container_width=True, hide_index=True)
+    make_chart_and_report(df)
 else:
-    st.info("Please upload your combined CSV to generate charts and the trend report.")
+    st.info("Please upload the combined KPI CSV to generate the visual and report.")
