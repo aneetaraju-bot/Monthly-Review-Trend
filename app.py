@@ -5,9 +5,9 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import streamlit as st
 
-st.set_page_config(page_title="Monthly Review – Simple Analysis", layout="wide")
-st.title("📊 Monthly Review – All Verticals per KPI with Red / Watch / Healthy Zones")
-st.write("Upload your **pivot-style CSV** (row 0 = Verticals, row 1 = KPIs, rows 2+ = Months like Jan25).")
+st.set_page_config(page_title="Monthly Review — Vertical Comparison", layout="wide")
+st.title("📊 Monthly Review — Vertical Comparison (All Verticals per KPI)")
+st.write("Upload your **pivot-style CSV**: row 0 = Verticals, row 1 = KPIs, rows 2+ = Months like Jan25.")
 
 uploaded = st.file_uploader("Upload CSV", type=["csv"])
 
@@ -30,7 +30,7 @@ TARGET_KPIS = list(THRESHOLDS.keys())
 # -----------------------
 def parse_pivot(file) -> pd.DataFrame:
     """
-    Return tidy long DF: Month | Vertical | KPI | Value
+    Return tidy DF: Month | Vertical | KPI | Value
     Row 0: Vertical names (sparse → forward-filled)
     Row 1: KPI names
     Row 2+: Month + values
@@ -79,7 +79,7 @@ def parse_pivot(file) -> pd.DataFrame:
 # KPI selection helpers
 # -----------------------
 def kpi_guess_options(all_metrics):
-    # Suggest likely matches; you can adjust in UI
+    # Suggest likely matches; user can adjust in UI
     key_map = {
         "AVERAGE of Course completion %": ["completion"],
         "AVERAGE of NPS": ["nps"],
@@ -97,11 +97,11 @@ def kpi_guess_options(all_metrics):
 # -----------------------
 # Aggregate per KPI & vertical (NO normalization)
 # -----------------------
-def agg_vertical_kpi(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame:
+def aggregate_vertical_kpi(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame:
     """
     Return Month | Vertical | KPI | Value (raw)
-      - Placements -> sum if multiple cols selected
-      - Others     -> mean
+      - Placements → sum if multiple cols selected
+      - Others     → mean
     """
     out = []
     for kpi, cols in selections.items():
@@ -124,52 +124,51 @@ def agg_vertical_kpi(tidy: pd.DataFrame, selections: dict) -> pd.DataFrame:
     return df.sort_values(["KPI","Vertical","Month"])
 
 # -----------------------
-# Plot one KPI (all verticals) with zones
+# Vertical comparison charts for ALL KPIs (small multiples)
 # -----------------------
-def plot_kpi_all_verticals(df: pd.DataFrame, kpi: str):
-    sub = df[df["KPI"] == kpi]
-    if sub.empty:
-        st.warning(f"No data for KPI: {kpi}")
-        return
-    piv = sub.pivot(index="Month", columns="Vertical", values="Value").sort_index()
-    fig, ax = plt.subplots(figsize=(12,6))
-    low, high = THRESHOLDS[kpi]
-    ymax = np.nanmax(piv.values) if np.isfinite(np.nanmax(piv.values)) else high
-    ymax = max(ymax, high)
+def show_all_vertical_comparisons(agg: pd.DataFrame, thresholds: dict):
+    kpis = [k for k in thresholds.keys() if k in agg["KPI"].unique()]
+    for kpi in kpis:
+        sub = agg[agg["KPI"] == kpi]
+        if sub.empty:
+            continue
+        piv = sub.pivot(index="Month", columns="Vertical", values="Value").sort_index()
 
-    # zones
-    ax.axhspan(0, low,  color="red",    alpha=0.10, label="_red_")
-    ax.axhspan(low, high, color="yellow", alpha=0.10, label="_watch_")
-    ax.axhspan(high, ymax, color="green",  alpha=0.10, label="_healthy_")
+        fig, ax = plt.subplots(figsize=(12, 6))
+        low, high = thresholds[kpi]
+        ymax = np.nanmax(piv.values) if np.isfinite(np.nanmax(piv.values)) else high
+        ymax = max(ymax, high)
 
-    for v in piv.columns:
-        ax.plot(piv.index.tolist(), piv[v], marker='o', label=v)
+        # Zones
+        ax.axhspan(0, low,    color="red",    alpha=0.10)
+        ax.axhspan(low, high, color="yellow", alpha=0.10)
+        ax.axhspan(high, ymax, color="green",  alpha=0.10)
 
-    ax.set_title(f"{kpi} — All Verticals (Raw Values)")
-    ax.set_xlabel("Month"); ax.set_ylabel("Value")
-    ax.set_xticks(range(len(piv.index)))
-    ax.set_xticklabels([str(m) for m in piv.index], rotation=45, ha='right')
-    ax.legend(bbox_to_anchor=(1.02,1), loc='upper left')
-    ax.grid(True)
-    st.pyplot(fig, clear_figure=True)
+        for v in piv.columns:
+            ax.plot(piv.index.tolist(), piv[v], marker='o', label=v)
+
+        ax.set_title(f"{kpi} — Vertical Comparison (Raw Values)")
+        ax.set_xlabel("Month"); ax.set_ylabel("Value")
+        ax.set_xticks(range(len(piv.index)))
+        ax.set_xticklabels([str(m) for m in piv.index], rotation=45, ha='right')
+        ax.legend(bbox_to_anchor=(1.02, 1), loc='upper left')
+        ax.grid(True)
+        st.pyplot(fig, clear_figure=True)
 
 # -----------------------
 # Simple summary (latest month per vertical & KPI)
 # -----------------------
-def quick_summary(df: pd.DataFrame):
-    st.subheader("📌 Quick Zone Summary (latest month per vertical & KPI)")
-    def last_row(g):
-        return g.sort_values("Month").iloc[-1]
-    latest = df.groupby(["KPI","Vertical"], group_keys=False).apply(last_row)
+def quick_zone_summary(agg: pd.DataFrame, thresholds: dict) -> str:
+    def last_row(g): return g.sort_values("Month").iloc[-1]
+    latest = agg.groupby(["KPI","Vertical"], group_keys=False).apply(last_row)
 
-    # Build a plain-text report and show it
     lines = []
-    for kpi in THRESHOLDS.keys():
+    for kpi, (low, high) in thresholds.items():
         lines.append(f"### {kpi}")
-        low, high = THRESHOLDS[kpi]
         rows = latest[latest["KPI"] == kpi]
         if rows.empty:
-            lines.append("  (no rows for this KPI after aggregation)")
+            lines.append("  (no rows for this KPI)")
+            lines.append("")
             continue
         for _, r in rows.iterrows():
             val = r["Value"]
@@ -183,10 +182,7 @@ def quick_summary(df: pd.DataFrame):
                 zone = "🟩 Healthy Zone"
             lines.append(f"- {r['Vertical']}: {zone} (Latest: {val:.2f})")
         lines.append("")
-    report_text = "\n".join(lines)
-    st.code(report_text)
-    st.download_button("⬇️ Download summary.txt", report_text.encode("utf-8"),
-                       file_name="summary.txt", mime="text/plain")
+    return "\n".join(lines)
 
 # -----------------------
 # App flow
@@ -194,37 +190,32 @@ def quick_summary(df: pd.DataFrame):
 if uploaded:
     tidy = parse_pivot(uploaded)
     if tidy.empty:
-        st.error("Parsed 0 rows. Confirm CSV has row0=verticals, row1=KPIs, and month labels like Jan25 in first column.")
+        st.error("Parsed 0 rows. Check CSV: row0=verticals, row1=KPIs, first column has months like Jan25.")
         st.stop()
 
-    st.subheader("Detected metrics")
-    all_m = sorted(tidy["KPI"].dropna().unique().tolist())
-    st.write(all_m)
+    st.subheader("Detected KPIs in your file")
+    all_metrics = sorted(tidy["KPI"].dropna().unique().tolist())
+    st.write(all_metrics)
 
-    st.markdown("### Map each target KPI to the metric names from your file")
-    guesses = {
-        # simple keyword guesses:
-        "AVERAGE of Course completion %": [m for m in all_m if "completion" in m.lower()],
-        "AVERAGE of NPS": [m for m in all_m if "nps" in m.lower()],
-        "SUM of No of Placements(Monthly)": [m for m in all_m if "placement" in m.lower()],
-        "AVERAGE of Reg to Placement %": [m for m in all_m if "reg to placement" in m.lower()],
-        "AVERAGE of Active Student %": [m for m in all_m if "active student" in m.lower()],
-        "AVERAGE of Avg Mentor Rating": [m for m in all_m if ("mentor" in m.lower() or "rating" in m.lower())],
-    }
+    st.markdown("### Map each target KPI to the KPI names in your file")
+    guesses = kpi_guess_options(all_metrics)
     selections = {}
     for k in TARGET_KPIS:
-        selections[k] = st.multiselect(f"Select columns for **{k}**", options=all_m, default=guesses.get(k, []))
+        selections[k] = st.multiselect(f"Select columns for **{k}**", options=all_metrics, default=guesses.get(k, []))
 
-    if st.button("Generate Charts + Summary", type="primary"):
-        agg = agg_vertical_kpi(tidy, selections)
+    if st.button("Generate Vertical Comparisons + Summary", type="primary"):
+        agg = aggregate_vertical_kpi(tidy, selections)
         st.caption(f"Tidy rows: {len(tidy):,} | Aggregated rows: {len(agg):,}")
+
         if agg.empty:
             st.error("Nothing aggregated. Adjust KPI selections or check your CSV.")
         else:
-            for k in TARGET_KPIS:
-                if k in agg["KPI"].unique():
-                    st.subheader(f"📈 {k}")
-                    plot_kpi_all_verticals(agg, k)
-            quick_summary(agg)
+            show_all_vertical_comparisons(agg, THRESHOLDS)
+
+            st.subheader("📝 Quick Zone Summary (Latest Month)")
+            report_text = quick_zone_summary(agg, THRESHOLDS)
+            st.code(report_text)
+            st.download_button("⬇️ Download summary.txt", report_text.encode("utf-8"),
+                               file_name="summary.txt", mime="text/plain")
 else:
     st.info("Upload the pivot CSV to continue.")
